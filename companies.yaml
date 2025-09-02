@@ -1,17 +1,12 @@
+# Only include slugs that we know work with the current adapters
+
 greenhouse:
   - duolingo
   - coursera
   - newsela
   - classdojo
-  - amplify
-  - dreamboxlearning
-  - learning-com
-  - ageoflearning
-  - zearn
-  - kiddom
-  - commonsensemedia
+  - ixllearning   # IXL's public board
 
 lever:
-  - udacity
-  - reupeducation
-  - neighborschools
+  - aofl          # Age of Learning / ABCmouse
+  - kiddom
