@@ -1,4 +1,6 @@
-# ---------- GREENHOUSE (boards-api.greenhouse.io) ----------
+# companies.yaml — ready to drop in
+
+# ---------- GREENHOUSE ----------
 greenhouse:
   - duolingo
   - coursera
@@ -12,30 +14,41 @@ greenhouse:
   - renaissancelearning-nam
   - 2u
   - edmentum
+  # Added from “ready to add now”
+  - brainpop
+  - tutorme          # Pear Deck Tutor (TutorMe)
+  - udacity
+  - masterclass
+  - grammarly
+  - securly13
+  - skillsoft
 
-# ---------- LEVER (api.lever.co) ----------
+# ---------- LEVER ----------
 lever:
-  - instructure    # confirmed public Lever API
+  - instructure
+  # Added
+  - aofl            # ABCmouse / Age of Learning
+  - kiddom
+  - goalbookapp-2   # Goalbook
 
-# ---------- WORKDAY (headless sniffer) ----------
-# Only host + tenant are required; 'site' is a hint (sniffer will discover the real one).
+# ---------- WORKDAY (headless) ----------
 workday:
-  - { company: Amplify,                host: amplify.wd1.myworkdayjobs.com,           tenant: amplify,                site: Amplify_Careers }
-  - { company: Curriculum Associates,  host: curriculumassociates.wd5.myworkdayjobs.com, tenant: curriculumassociates, site: External }
-  - { company: College Board,          host: collegeboard.wd1.myworkdayjobs.com,      tenant: collegeboard,           site: Careers }
-  - { company: Cambium Assessment,     host: cambiumlearning.wd1.myworkdayjobs.com,   tenant: cambiumlearning,        site: camb }
+  - { company: Amplify,               host: amplify.wd1.myworkdayjobs.com,             tenant: amplify,               site: Amplify_Careers }
+  - { company: Curriculum Associates, host: curriculumassociates.wd5.myworkdayjobs.com, tenant: curriculumassociates, site: External }
+  - { company: College Board,         host: collegeboard.wd1.myworkdayjobs.com,        tenant: collegeboard,          site: Careers }
+  - { company: Cambium Assessment,    host: cambiumlearning.wd1.myworkdayjobs.com,     tenant: cambiumlearning,       site: camb }
+  # Added
+  - { company: Chegg,                 host: osv-chegg.wd5.myworkdayjobs.com,           tenant: osv-chegg,             site: Chegg }
 
 # ---------- WORKABLE ----------
-# HTML fallback is built-in if the API 404s.
 workable:
   - { company: Riverside Insights, account: riverside-insights }
+  # Added
+  - { company: Zearn, account: zearn }
 
 # ---------- iCIMS ----------
 icims:
   - { company: PowerSchool, host: careers-powerschool.icims.com }
-
-dejobs:
-  - { company: Pearson, host: pearson.jobs }
 
 # ---------- TEAMTAILOR ----------
 teamtailor:
@@ -43,7 +56,8 @@ teamtailor:
 
 # ---------- ADP Workforce Now ----------
 adp:
-  - { company: Cognia, host: workforcenow.adp.com }
+  - { company: Cognia,       host: workforcenow.adp.com }
+  - { company: Learning.com, host: workforcenow.adp.com }
 
 # ---------- SAP SuccessFactors ----------
 successfactors:
@@ -58,42 +72,7 @@ jobvite:
 pereless:
   - { company: ETS, host: etscareers.submit4jobs.com }
 
-# ---------- OPTIONAL / NOT YET MAPPED TO A SUPPORTED ADAPTER ----------
-# Leave these commented out so the job stays clean. When you’re ready,
-# I can wire an adapter (or confirm their ATS + params) and move them above.
-#
-# Recruitee (needs adapter): greatminds.recruitee.com
-#   - { company: Great Minds PBC, host: greatminds.recruitee.com }
-#
-# Likely Greenhouse but not fully verified in this repo (risk of 404 if wrong):
-#   - brainpop
-#   - securly13
-#   - grammarly
-#   - skillsoft
-#   - masterclass
-#
-# Lever prospects that often 404 on public API:
-#   - goalbookapp-2
-#   - aofl
-#   - kiddom
-#
-# Site-hosted / unclear ATS (generic site crawler needed):
-#   NeighborSchools
-#   ReUp Education
-#   Edsby
-#   Proctorio
-#   Honorlock
-#   Formative (GoFormative)
-#   Otus
-#   Discovery Education
-#   Savvas Learning Company
-#   MobyMax
-#   Common Sense Media
-#   Hurix
-#   Prometric
-#   PSI Services
-#   Meazure Learning (ProctorU)
-#   Examity
-#   Wolfram (Trakstar)
-#   Goalbook (if not Lever)
-#   Pearson VUE (routes via Pearson/other portals)
+# ---------- .JOBS / DirectEmployers ----------
+dejobs:
+  - { company: Pearson,      host: pearson.jobs }
+  - { company: Pearson VUE,  host: pearson.jobs }
