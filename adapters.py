@@ -262,6 +262,130 @@ def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return out
 
+# --- Headless Workday adapter (Playwright) ---
+def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Uses a real Chromium session to call the Workday CxS endpoint from the page context.
+    This avoids 400s due to missing cookies/headers.
+
+    companies.yaml format:
+      - { company: Amplify, host: amplify.wd1.myworkdayjobs.com, tenant: amplify, site: Amplify_Careers }
+    """
+    from playwright.sync_api import sync_playwright
+    out: List[Dict[str, Any]] = []
+
+    host = (entry.get("host") or "").strip()
+    tenant = (entry.get("tenant") or "").strip()
+    site_hint = (entry.get("site") or "").strip()
+    company = entry.get("company") or tenant or host
+    if not (host and tenant):
+        _warn(f"[WARN] workday(headless) bad entry: {entry}")
+        return out
+
+    def cxs_fetch(page, site_token: str) -> Optional[Dict[str, Any]]:
+        # Run the POST from within the page so cookies/headers are correct.
+        return page.evaluate(
+            """async ({tenant, site}) => {
+                const payload = {appliedFacets:{}, limit:50, offset:0, searchText:"music"};
+                const res = await fetch(`/wday/cxs/${tenant}/${site}/jobs`, {
+                  method: 'POST',
+                  headers: {'content-type':'application/json'},
+                  body: JSON.stringify(payload),
+                  credentials: 'same-origin'
+                });
+                if (!res.ok) return {ok:false, status: res.status};
+                const json = await res.json();
+                return {ok:true, status: res.status, json};
+            }""",
+            {"tenant": tenant, "site": site_token},
+        )
+
+    def sites_from_dom(page) -> List[str]:
+        # Collect /en-XX/<SiteToken>/ anchors as candidates.
+        anchors = page.eval_on_selector_all(
+            "a[href*='/en-']", "els => els.map(a => a.getAttribute('href'))"
+        ) or []
+        cand = []
+        for href in anchors:
+            if not href:
+                continue
+            m = re.search(r"/en-[A-Z]{2}/([^/]+)/", href)
+            if m:
+                cand.append(m.group(1))
+        # Add some common fallbacks.
+        cand += ["Careers", "External", "Career", "Jobs", "US", "Students", "Campus"]
+        # De-dupe but keep order
+        seen, ordered = set(), []
+        for s in [site_hint] + [x for x in cand if x] if site_hint else cand:
+            if s and s not in seen:
+                seen.add(s); ordered.append(s)
+        return ordered[:20]
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(ignore_https_errors=True, user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MusicJobs/HD1"
+        ))
+        page = context.new_page()
+
+        # Hit the root first to establish cookies, then an en-US page if it exists.
+        for url in [f"https://{host}/", f"https://{host}/en-US"]:
+            try:
+                page.goto(url, wait_until="networkidle", timeout=45000)
+                break
+            except Exception:
+                continue
+
+        # Build candidate site tokens and try them until one returns JSON.
+        for site_token in sites_from_dom(page):
+            try:
+                # Navigate to a page under that site (improves success for some tenants)
+                page.goto(f"https://{host}/en-US/{site_token}", wait_until="networkidle", timeout=45000)
+            except Exception:
+                pass
+
+            try:
+                resp = cxs_fetch(page, site_token)
+            except Exception:
+                _warn(f"[WARN] workday(headless):{tenant}/{site_token} JS fetch failed")
+                continue
+
+            if not resp or not resp.get("ok"):
+                _warn(f"[WARN] workday:{tenant}/{site_token} -> HTTP {resp.get('status') if resp else 'n/a'}")
+                continue
+
+            jobs = (resp.get("json") or {}).get("jobPostings") or (resp.get("json") or {}).get("jobs") or []
+            for j in jobs:
+                title = (j.get("title") or "").strip()
+                urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
+                if urlp and urlp.startswith("/"):
+                    urlp = f"https://{host}{urlp}"
+                # Location
+                loc = ""
+                locs = j.get("locations") or j.get("bulletFields") or []
+                if isinstance(locs, list):
+                    loc = ", ".join(str(x) for x in locs if x)
+                elif isinstance(locs, str):
+                    loc = locs
+                desc = " ".join([
+                    j.get("shortDescription") or "",
+                    j.get("jobPostingInfo", {}).get("jobDescription", "")
+                ]).strip()
+                if job_matches_music(f"{title}\n{loc}\n{desc}"):
+                    jid = j.get("id") or j.get("jobId") or j.get("externalId") or ""
+                    posted = (j.get("postedOn") or j.get("startDate") or "").replace(" ", "T")
+                    if posted and not posted.endswith("Z"): posted += "Z"
+                    out.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
+
+            if out:
+                break  # first working site is enough
+
+        context.close()
+        browser.close()
+
+    return out
+
 
 # ---------------- Workable ----------------
 def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
