@@ -24,6 +24,7 @@ workable:
 
 icims:
   - { company: PowerSchool, host: careers-powerschool.icims.com }
+  - { company: McGraw Hill, host: careers-mheducation.icims.com }
 
 teamtailor:
   - { company: Data Recognition Corporation, host: careers.datarecognitioncorp.com }
