@@ -10,7 +10,7 @@ from utils import (
     load_seen, save_seen, append_csv, job_matches_music, mk_row
 )
 
-# ---------- session with retries & headers ----------
+# ---------- HTTP session with retries & headers ----------
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -35,11 +35,11 @@ def make_session() -> requests.Session:
 SESSION = make_session()
 REQ_TIMEOUT = 35
 
+# ---------- helpers ----------
 def _slugify(v: Optional[str]) -> Optional[str]:
     if v is None:
         return None
     s = str(v).strip()
-    # filter obvious junk or comments
     if not s or s.startswith("#"):
         return None
     return s
@@ -63,7 +63,6 @@ def fetch_greenhouse(company_slug: str) -> List[Dict[str, Any]]:
     if not r:
         print(f"[WARN] greenhouse:{company_slug} JSON fetch failed", file=sys.stderr)
         return out
-
     try:
         data = r.json()
     except Exception:
@@ -76,11 +75,12 @@ def fetch_greenhouse(company_slug: str) -> List[Dict[str, Any]]:
         abs_url = job.get("absolute_url", "") or ""
         job_id = str(job.get("id", "") or "")
 
+        # Fast path: title contains music
         if job_matches_music(title):
             out.append(mk_row(company_slug, "greenhouse", title, location, job_id, abs_url, "", "title"))
             continue
 
-        # Only fetch HTML if title didn't match
+        # Slow path: fetch HTML once to search body
         if abs_url:
             jr = _safe_get(abs_url)
             if jr and job_matches_music(f"{title}\n{location}\n{jr.text or ''}"):
@@ -143,6 +143,7 @@ def fetch_lever(company_slug: str) -> List[Dict[str, Any]]:
         out.append(mk_row(company_slug, "lever", title, location, str(job_id), apply_url, iso, matched_on))
     return out
 
+# ---------- Dispatcher ----------
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "lever": fetch_lever,
@@ -164,6 +165,7 @@ def run(platform_filter: Optional[str] = None, company_filter: Optional[str] = N
     items = list(cfg.items()) if isinstance(cfg, dict) else []
     for platform, companies in items:
         if platform not in FETCHERS:
+            # Ignore unsupported keys like comments or future adapters
             continue
         if platform_filter and platform != platform_filter:
             continue
