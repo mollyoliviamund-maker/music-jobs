@@ -3,6 +3,11 @@ import sys, json, datetime, re
 import requests
 from bs4 import BeautifulSoup
 
+# --- put near the top with the other imports ---
+import re, warnings
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -107,72 +112,113 @@ def fetch_lever(slug: str) -> List[Dict[str, Any]]:
     return out
 
 # ---------------- Workday CxS ----------------
-# ---- helpers for Workday ----
-import re
-from bs4 import BeautifulSoup
+# ---- Workday helpers (add these above fetch_workday) ----
+def _dedupe_keep_order(items):
+    seen = set()
+    out = []
+    for x in items:
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
 
-def _wd_discover_sites(host: str, tenant: str, seeds: list[str] | None = None) -> list[str]:
-    """
-    Try to discover valid Workday 'site' tokens by scanning public pages.
-    We look for URLs like /en-US/<SiteToken>/ and test them against CxS.
-    """
+def _wd_scrape_sites_from_html(host: str, paths: list[str]) -> list[str]:
     candidates = []
-    seeds = seeds or []
-    # Common defaults
-    defaults = ["Careers", "External", "Career", "Jobs", "US"]
-    for s in seeds + defaults:
-        if s and s not in candidates:
-            candidates.append(s)
-
-    def scrape_for_sites(url: str):
+    for path in paths:
         try:
-            r = SESSION.get(url, timeout=REQ_TIMEOUT)
+            r = SESSION.get(f"https://{host}{path}", timeout=REQ_TIMEOUT)
             if r.status_code >= 400:
-                return
+                continue
             soup = BeautifulSoup(r.text, "lxml")
-            for a in soup.select("a[href*='/en-US/']"):
+            # Look for /en-XX/<SiteToken>/ patterns
+            for a in soup.select("a[href]"):
                 href = a.get("href") or ""
-                m = re.search(r"/en-US/([^/]+)/", href)
+                m = re.search(r"/en-[A-Z]{2}/([^/]+)/", href)
                 if m:
-                    site = m.group(1)
-                    if site and site not in candidates:
-                        candidates.append(site)
+                    candidates.append(m.group(1))
         except Exception:
-            pass
+            continue
+    return _dedupe_keep_order(candidates)
 
-    # Scan a couple of public pages
-    scrape_for_sites(f"https://{host}/")
-    scrape_for_sites(f"https://{host}/en-US")
-    scrape_for_sites(f"https://{host}/en-US/Careers")
-    return candidates[:12]  # keep it small
+def _wd_discover_sites(host: str, tenant: str, provided: str | None) -> list[str]:
+    seeds = [provided] if provided else []
+    # Common defaults (both cases)
+    defaults = [
+        "Careers", "careers", "External", "external",
+        "Career", "career", "Jobs", "jobs",
+        "US", "usa", "NA", "na", "NorthAmerica", "northamerica",
+        "Campus", "campus", "Students", "students", "EarlyCareers", "earlycareers"
+    ]
+    seeds += defaults
 
+    # Try config endpoint (not all tenants expose this)
+    try:
+        cfg = SESSION.get(f"https://{host}/wday/cxs/{tenant}/config", timeout=REQ_TIMEOUT)
+        if cfg.status_code < 400:
+            try:
+                j = cfg.json() or {}
+                # VERY tenant-specific; grab anything that looks like a site token-ish string
+                # e.g. j.get("branding", {}).get("sites") -> [{"name": "Careers"}, ...]
+                sites = []
+                branding = j.get("branding") or {}
+                for v in branding.values():
+                    if isinstance(v, list):
+                        for it in v:
+                            if isinstance(it, dict):
+                                for k, val in it.items():
+                                    if isinstance(val, str) and 2 <= len(val) <= 40 and "/" not in val:
+                                        sites.append(val)
+                seeds += sites
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Scrape a couple of public pages for /en-XX/<Site>/
+    seeds += _wd_scrape_sites_from_html(host, ["", "/en-US", "/en-GB", "/careers", "/career"])
+
+    # Underscore/hyphen variants for provided sites if present
+    if provided and ("_" in provided or "-" in provided):
+        seeds += [provided.replace("_", "-"), provided.replace("-", "_")]
+
+    return _dedupe_keep_order(seeds)[:20]
+
+
+# ---- REPLACE your existing fetch_workday with this version ----
 def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     host = (entry.get("host") or "").strip()
     tenant = (entry.get("tenant") or "").strip()
-    site = (entry.get("site") or "").strip()
+    site_hint = (entry.get("site") or "").strip()
     company = entry.get("company") or tenant or host
     if not (host and tenant):
         _warn(f"[WARN] workday bad entry (need host+tenant): {entry}")
         return out
 
-    def try_site(sitename: str) -> List[Dict[str, Any]]:
-        url = f"https://{host}/wday/cxs/{tenant}/{sitename}/jobs"
+    def try_site(site_token: str) -> List[Dict[str, Any]]:
+        url = f"https://{host}/wday/cxs/{tenant}/{site_token}/jobs"
         payload = {"appliedFacets": {}, "limit": 50, "offset": 0, "searchText": "music"}
-        r = SESSION.post(url, data=json.dumps(payload), timeout=REQ_TIMEOUT)
+        # Some tenants require Referer/Origin/Accept-Language
+        headers = {
+            "Referer": f"https://{host}/en-US/{site_token}",
+            "Origin": f"https://{host}",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = SESSION.post(url, json=payload, headers=headers, timeout=REQ_TIMEOUT)
         if r.status_code >= 400:
-            _warn(f"[WARN] workday:{tenant}/{sitename} -> HTTP {r.status_code}")
+            _warn(f"[WARN] workday:{tenant}/{site_token} -> HTTP {r.status_code}")
             return []
         try:
             data = r.json()
         except Exception:
-            _warn(f"[WARN] workday:{tenant}/{sitename} invalid JSON")
+            _warn(f"[WARN] workday:{tenant}/{site_token} invalid JSON")
             return []
         jobs = data.get("jobPostings") or data.get("jobs") or []
-        results: List[Dict[str, Any]] = []
-        for j in jobs:
+        found = []
+        for j in jobs or []:
             title = (j.get("title") or "").strip()
-            # Build URL
+            # URL
             urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
             if urlp and urlp.startswith("/"):
                 urlp = f"https://{host}{urlp}"
@@ -183,34 +229,33 @@ def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 loc = ", ".join(str(x) for x in locs if x)
             elif isinstance(locs, str):
                 loc = locs
-            # Desc (best-effort)
+            # Description (best effort)
             desc = " ".join([
                 j.get("shortDescription") or "",
                 j.get("jobPostingInfo", {}).get("jobDescription", "")
             ]).strip()
-
             if job_matches_music(f"{title}\n{loc}\n{desc}"):
                 jid = j.get("id") or j.get("jobId") or j.get("externalId") or ""
                 posted = (j.get("postedOn") or j.get("startDate") or "").replace(" ", "T")
                 if posted and not posted.endswith("Z"):
                     posted += "Z"
-                results.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
-        return results
+                found.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
+        return found
 
-    # If a site is provided, try it first.
     tried = set()
-    if site:
-        tried.add(site)
-        out.extend(try_site(site))
+    # 1) Try provided site first (if any)
+    if site_hint:
+        tried.add(site_hint)
+        out.extend(try_site(site_hint))
         if out:
-            return out  # good
+            return out
 
-    # Auto-discover potential sites and try them
-    for s in _wd_discover_sites(host, tenant, seeds=[site] if site else []):
-        if s in tried:
+    # 2) Discover & try candidates
+    for cand in _wd_discover_sites(host, tenant, site_hint):
+        if cand in tried:
             continue
-        tried.add(s)
-        res = try_site(s)
+        tried.add(cand)
+        res = try_site(cand)
         if res:
             out.extend(res)
             break  # first working site is enough
