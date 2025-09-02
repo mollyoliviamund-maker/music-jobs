@@ -33,7 +33,9 @@ workable:
 # ---------- iCIMS ----------
 icims:
   - { company: PowerSchool, host: careers-powerschool.icims.com }
-  - { company: McGraw Hill, host: careers-mcgrawhill.icims.com }
+
+dejobs:
+  - { company: Pearson, host: pearson.jobs }
 
 # ---------- TEAMTAILOR ----------
 teamtailor:
