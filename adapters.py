@@ -291,6 +291,125 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         browser.close()
     return out
 
+# ---------------- .jobs / DirectEmployers (HTML + headless fallback) ----------------
+import os
+from urllib.parse import quote_plus
+
+def fetch_dejobs(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Scrapes a .jobs / DirectEmployers career site (e.g., pearson.jobs).
+    Strategy:
+      1) Try server-rendered search result pages: https://<host>/search/?q=<kw> and /jobs/?q=<kw>
+      2) Collect job detail links containing '/job/' (same host).
+      3) If nothing found, use Playwright to render and extract those links.
+      4) Visit job pages, match keyword(s) against title/description, emit rows.
+
+    companies.yaml:
+      dejobs:
+        - { company: Pearson, host: pearson.jobs }
+    """
+    out: List[Dict[str, Any]] = []
+    host = (entry.get("host") or "").strip().rstrip("/")
+    company = entry.get("company") or host
+    if not host:
+        return out
+
+    kw = os.getenv("KEYWORDS", "music")  # supports alternation via env like: music|audio|sound
+    queries = [f"https://{host}/search/?q={quote_plus(kw)}",
+               f"https://{host}/jobs/?q={quote_plus(kw)}"]
+
+    def collect_links_from_html(html: str) -> List[str]:
+        soup = BeautifulSoup(html or "", "lxml")
+        links = []
+        for a in soup.select("a[href*='/job/']"):
+            href = a.get("href")
+            if not href:
+                continue
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = f"https://{host}{href}"
+            if host in href:
+                links.append(href)
+        # de-dup keep order
+        seen, ordered = set(), []
+        for u in links:
+            if u not in seen:
+                seen.add(u); ordered.append(u)
+        return ordered
+
+    # 1) Try static pages
+    job_links: List[str] = []
+    for url in queries:
+        try:
+            r = SESSION.get(url, timeout=REQ_TIMEOUT)
+            if r.status_code < 400:
+                job_links += collect_links_from_html(r.text)
+        except Exception:
+            continue
+
+    # 2) Headless fallback if we saw no links
+    if not job_links:
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                ctx = browser.new_context(ignore_https_errors=True)
+                page = ctx.new_page()
+                for url in queries:
+                    try:
+                        page.goto(url, wait_until="networkidle", timeout=45000)
+                        # collect anchors with '/job/' in href
+                        links = page.eval_on_selector_all(
+                            "a[href*='/job/']",
+                            "els => els.map(a => a.href)"
+                        ) or []
+                        for u in links:
+                            if host in u and u not in job_links:
+                                job_links.append(u)
+                        if job_links:
+                            break
+                    except Exception:
+                        continue
+                ctx.close(); browser.close()
+        except Exception:
+            _warn(f"[WARN] dejobs:{host} headless fallback failed")
+
+    # 3) Visit job pages and emit matches
+    for job_url in job_links[:80]:
+        try:
+            jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
+            if jr.status_code >= 400:
+                continue
+            jsoup = BeautifulSoup(jr.text, "lxml")
+            # Title
+            title_el = jsoup.find("h1") or jsoup.select_one("h1.job-title")
+            title = (title_el.get_text(strip=True) if title_el else "").strip()
+            # Heuristic location: often a line just under H1 or a <p> containing comma+country code
+            loc = ""
+            try:
+                h1_parent = title_el.find_parent() if title_el else None
+                if h1_parent:
+                    nxt = h1_parent.find_next(string=True)
+                    if nxt:
+                        cand = str(nxt).strip()
+                        if len(cand) <= 80 and ("," in cand or cand.isupper()):
+                            loc = cand
+            except Exception:
+                pass
+            # Full text for keyword match
+            desc = jsoup.get_text(" ", strip=True)[:20000]
+            if job_matches_music(f"{title}\n{loc}\n{desc}"):
+                # ID: grab the GUID-like token before /job/
+                m = re.search(r"/([A-Za-z0-9]{16,})/job/?", job_url)
+                jid = m.group(1) if m else job_url
+                out.append(mk_row(company, "dejobs", title, loc, jid, job_url, "", "title_or_description"))
+        except Exception:
+            continue
+
+    return out
+
+
 # ---------------- Workable (API first, HTML fallback) ----------------
 def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
