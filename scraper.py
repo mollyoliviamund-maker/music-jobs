@@ -3,10 +3,14 @@ from typing import Dict, Any, List
 
 from utils import load_seen, save_seen, append_csv
 from adapters import (
-    fetch_greenhouse, fetch_lever, fetch_workday_headless,
+    fetch_greenhouse, fetch_lever,
+    fetch_workday_headless,
     fetch_workable, fetch_icims, fetch_teamtailor,
-    fetch_adp, fetch_successfactors, fetch_jobvite, fetch_pereless, fetch_dejobs
+    fetch_adp, fetch_successfactors, fetch_jobvite, fetch_pereless,
+    fetch_dejobs,
 )
+
+EMAIL_BODY_PATH = "email_body.md"
 
 FETCHERS = {
     "greenhouse": lambda slug: fetch_greenhouse(slug),
@@ -36,6 +40,7 @@ def run(platform_filter=None, company_filter=None):
 
     seen = load_seen()
     total_new = 0
+    email_jobs: List[Dict[str, Any]] = []
 
     # simple list-based platforms
     for plat in ["greenhouse", "lever"]:
@@ -59,6 +64,7 @@ def run(platform_filter=None, company_filter=None):
                     continue
                 seen.add(key)
                 append_csv(j)
+                email_jobs.append(j)   # <-- add to email
                 total_new += 1
                 new_count += 1
                 print(f"[NEW] {j['company']} | {j['title']} | {j['url']}")
@@ -86,18 +92,38 @@ def run(platform_filter=None, company_filter=None):
                     continue
                 seen.add(key)
                 append_csv(j)
+                email_jobs.append(j)   # <-- add to email
                 total_new += 1
                 new_count += 1
                 print(f"[NEW] {j['company']} | {j['title']} | {j['url']}")
             print(f"[SUMMARY] {plat}:{cname} -> {new_count} new", file=sys.stderr)
 
     save_seen(seen)
+
+    # write email body if we found anything
+    if email_jobs:
+        with open(EMAIL_BODY_PATH, "w", encoding="utf-8") as f:
+            f.write(f"<h2>{len(email_jobs)} new 'Music' jobs found</h2>\n<ul>\n")
+            for j in email_jobs:
+                title = j.get("title","")
+                company = j.get("company","")
+                plat = j.get("platform","")
+                loc = j.get("location","")
+                url = j.get("url","")
+                f.write(
+                    f"<li><b>{company}</b> — {title}"
+                    f"{' · ' + loc if loc else ''} "
+                    f"(<i>{plat}</i>) — "
+                    f"<a href=\"{url}\">View</a></li>\n"
+                )
+            f.write("</ul>\n")
+
     print(f"Done. New matches: {total_new}")
     return 0
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Multi-ATS Music Job Watcher")
-    ap.add_argument("--platform", help="Limit to one platform (greenhouse, lever, workday, workable, icims, teamtailor, adp, successfactors, jobvite, pereless)")
+    ap.add_argument("--platform", help="Limit to one platform")
     ap.add_argument("--company", help="Limit to one company slug/host/name")
     return ap.parse_args()
 
