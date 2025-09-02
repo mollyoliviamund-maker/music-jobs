@@ -1,17 +1,22 @@
 from typing import List, Dict, Any, Optional
-import sys, json, datetime, re
+import sys, json, datetime, re, warnings
+
 import requests
 from bs4 import BeautifulSoup
-
-# --- put near the top with the other imports ---
-import re, warnings
-from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
-warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+try:
+    # bs4 >=4.12
+    from bs4 import MarkupResemblesLocatorWarning
+except Exception:  # pragma: no cover
+    class MarkupResemblesLocatorWarning(UserWarning):
+        pass
 
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from utils import job_matches_music, mk_row
+
+# Silence noisy BS4 warning in CI logs
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 # --------- shared HTTP session ----------
 def make_session() -> requests.Session:
@@ -19,7 +24,7 @@ def make_session() -> requests.Session:
     s.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MusicJobs/2.0"
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MusicJobs/2.1"
         ),
         "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
         "Content-Type": "application/json",
@@ -111,168 +116,17 @@ def fetch_lever(slug: str) -> List[Dict[str, Any]]:
             out.append(mk_row(slug, "lever", title, location, str(job_id), apply_url, iso, matched))
     return out
 
-# ---------------- Workday CxS ----------------
-# ---- Workday helpers (add these above fetch_workday) ----
-def _dedupe_keep_order(items):
-    seen = set()
-    out = []
-    for x in items:
-        if not x or x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-def _wd_scrape_sites_from_html(host: str, paths: list[str]) -> list[str]:
-    candidates = []
-    for path in paths:
-        try:
-            r = SESSION.get(f"https://{host}{path}", timeout=REQ_TIMEOUT)
-            if r.status_code >= 400:
-                continue
-            soup = BeautifulSoup(r.text, "lxml")
-            # Look for /en-XX/<SiteToken>/ patterns
-            for a in soup.select("a[href]"):
-                href = a.get("href") or ""
-                m = re.search(r"/en-[A-Z]{2}/([^/]+)/", href)
-                if m:
-                    candidates.append(m.group(1))
-        except Exception:
-            continue
-    return _dedupe_keep_order(candidates)
-
-def _wd_discover_sites(host: str, tenant: str, provided: str | None) -> list[str]:
-    seeds = [provided] if provided else []
-    # Common defaults (both cases)
-    defaults = [
-        "Careers", "careers", "External", "external",
-        "Career", "career", "Jobs", "jobs",
-        "US", "usa", "NA", "na", "NorthAmerica", "northamerica",
-        "Campus", "campus", "Students", "students", "EarlyCareers", "earlycareers"
-    ]
-    seeds += defaults
-
-    # Try config endpoint (not all tenants expose this)
-    try:
-        cfg = SESSION.get(f"https://{host}/wday/cxs/{tenant}/config", timeout=REQ_TIMEOUT)
-        if cfg.status_code < 400:
-            try:
-                j = cfg.json() or {}
-                # VERY tenant-specific; grab anything that looks like a site token-ish string
-                # e.g. j.get("branding", {}).get("sites") -> [{"name": "Careers"}, ...]
-                sites = []
-                branding = j.get("branding") or {}
-                for v in branding.values():
-                    if isinstance(v, list):
-                        for it in v:
-                            if isinstance(it, dict):
-                                for k, val in it.items():
-                                    if isinstance(val, str) and 2 <= len(val) <= 40 and "/" not in val:
-                                        sites.append(val)
-                seeds += sites
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Scrape a couple of public pages for /en-XX/<Site>/
-    seeds += _wd_scrape_sites_from_html(host, ["", "/en-US", "/en-GB", "/careers", "/career"])
-
-    # Underscore/hyphen variants for provided sites if present
-    if provided and ("_" in provided or "-" in provided):
-        seeds += [provided.replace("_", "-"), provided.replace("-", "_")]
-
-    return _dedupe_keep_order(seeds)[:20]
-
-
-# ---- REPLACE your existing fetch_workday with this version ----
-def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    host = (entry.get("host") or "").strip()
-    tenant = (entry.get("tenant") or "").strip()
-    site_hint = (entry.get("site") or "").strip()
-    company = entry.get("company") or tenant or host
-    if not (host and tenant):
-        _warn(f"[WARN] workday bad entry (need host+tenant): {entry}")
-        return out
-
-    def try_site(site_token: str) -> List[Dict[str, Any]]:
-        url = f"https://{host}/wday/cxs/{tenant}/{site_token}/jobs"
-        payload = {"appliedFacets": {}, "limit": 50, "offset": 0, "searchText": "music"}
-        # Some tenants require Referer/Origin/Accept-Language
-        headers = {
-            "Referer": f"https://{host}/en-US/{site_token}",
-            "Origin": f"https://{host}",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        r = SESSION.post(url, json=payload, headers=headers, timeout=REQ_TIMEOUT)
-        if r.status_code >= 400:
-            _warn(f"[WARN] workday:{tenant}/{site_token} -> HTTP {r.status_code}")
-            return []
-        try:
-            data = r.json()
-        except Exception:
-            _warn(f"[WARN] workday:{tenant}/{site_token} invalid JSON")
-            return []
-        jobs = data.get("jobPostings") or data.get("jobs") or []
-        found = []
-        for j in jobs or []:
-            title = (j.get("title") or "").strip()
-            # URL
-            urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
-            if urlp and urlp.startswith("/"):
-                urlp = f"https://{host}{urlp}"
-            # Location
-            loc = ""
-            locs = j.get("locations") or j.get("bulletFields") or []
-            if isinstance(locs, list):
-                loc = ", ".join(str(x) for x in locs if x)
-            elif isinstance(locs, str):
-                loc = locs
-            # Description (best effort)
-            desc = " ".join([
-                j.get("shortDescription") or "",
-                j.get("jobPostingInfo", {}).get("jobDescription", "")
-            ]).strip()
-            if job_matches_music(f"{title}\n{loc}\n{desc}"):
-                jid = j.get("id") or j.get("jobId") or j.get("externalId") or ""
-                posted = (j.get("postedOn") or j.get("startDate") or "").replace(" ", "T")
-                if posted and not posted.endswith("Z"):
-                    posted += "Z"
-                found.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
-        return found
-
-    tried = set()
-    # 1) Try provided site first (if any)
-    if site_hint:
-        tried.add(site_hint)
-        out.extend(try_site(site_hint))
-        if out:
-            return out
-
-    # 2) Discover & try candidates
-    for cand in _wd_discover_sites(host, tenant, site_hint):
-        if cand in tried:
-            continue
-        tried.add(cand)
-        res = try_site(cand)
-        if res:
-            out.extend(res)
-            break  # first working site is enough
-
-    return out
-
-# --- Headless Workday adapter (Playwright) ---
+# ---------------- Workday (headless sniffer via Playwright) ----------------
 def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Headless Workday adapter that *sniffs* the portal's own jobs XHR to discover:
       - variant: /wday/cx/ or /wday/cxs/
-      - tenant:   actually used by the portal (may differ in case)
-      - site:     the real site token
+      - tenant:  actually used by the portal (may differ in case)
+      - site:    the real site token
     Then it posts the same endpoint with searchText="music".
     """
     from playwright.sync_api import sync_playwright
-    import re, json
+
     out: List[Dict[str, Any]] = []
 
     host = (entry.get("host") or "").strip()
@@ -283,11 +137,9 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         _warn(f"[WARN] workday(headless) missing host: {entry}")
         return out
 
-    # Keep first discovered endpoint here.
     sniff = {"variant": None, "tenant": None, "site": None}
 
     def parse_jobs_url(url: str):
-        # Match .../wday/(cx|cxs)/<tenant>/<site>/jobs...
         m = re.search(r"/wday/(cxs|cx)/([^/]+)/([^/]+)/jobs", url)
         if m:
             sniff["variant"], sniff["tenant"], sniff["site"] = m.group(1), m.group(2), m.group(3)
@@ -300,14 +152,13 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         ))
         page = context.new_page()
 
-        # Watch all responses to capture the portal's own jobs call.
         def on_response(resp):
             url = resp.url
             if "/wday/cx" in url or "/wday/cxs" in url:
                 parse_jobs_url(url)
         page.on("response", on_response)
 
-        # 1) Land on the host root to establish cookies
+        # establish cookies
         for url in [f"https://{host}/", f"https://{host}/en-US", f"https://{host}/career", f"https://{host}/careers"]:
             try:
                 page.goto(url, wait_until="networkidle", timeout=45000)
@@ -315,30 +166,25 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             except Exception:
                 continue
 
-        # 2) Try a few obvious portal pages to trigger the jobs XHR
-        candidate_paths = []
-        # collect hrefs from the DOM that look promising
+        # try to trigger the XHR
+        candidate_paths: List[str] = []
         try:
-            hrefs = page.eval_on_selector_all(
-                "a[href]", "els => els.map(a => a.getAttribute('href'))"
-            ) or []
+            hrefs = page.eval_on_selector_all("a[href]", "els => els.map(a => a.getAttribute('href'))") or []
         except Exception:
             hrefs = []
 
         for h in hrefs:
             if not h:
                 continue
-            if h.startswith("//"):  # protocol-relative
+            if h.startswith("//"):
                 h = "https:" + h
             if h.startswith("/"):
                 h = f"https://{host}{h}"
             if host not in h:
                 continue
-            # keep likely career/search links
             if any(k in h.lower() for k in ["career", "careers", "jobs", "search", "/en-"]):
                 candidate_paths.append(h)
 
-        # Always try common en-US paths first
         hardcoded = [
             f"https://{host}/en-US/Careers",
             f"https://{host}/en-US/External",
@@ -355,7 +201,7 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             except Exception:
                 continue
 
-        # 3) If we still didn't sniff anything, try a direct POST with common variants
+        # direct attempts if still nothing
         def try_direct(variant: str, tenant: str, site: str):
             return page.evaluate(
                 """async ({variant, tenant, site}) => {
@@ -372,8 +218,8 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
 
         if not sniff["variant"]:
-            tenants = [sniff["tenant"], tenant_hint, (tenant_hint or "").lower(),
-                       (tenant_hint or "").upper()]
+            tenants = [sniff["tenant"], tenant_hint, tenant_hint.lower() if tenant_hint else None,
+                       tenant_hint.upper() if tenant_hint else None]
             sites = [sniff["site"], site_hint, "Careers", "External", "Jobs", "US", "Students", "Campus"]
             tenants = [t for t in tenants if t]
             sites = [s for s in sites if s]
@@ -382,7 +228,7 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 for t in tenants:
                     for s in sites:
                         key = (v, t, s)
-                        if key in tried: 
+                        if key in tried:
                             continue
                         tried.add(key)
                         try:
@@ -397,13 +243,12 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if sniff["variant"]:
                     break
 
-        # 4) If still nothing, bail.
         if not sniff["variant"]:
             context.close(); browser.close()
             _warn(f"[WARN] workday({company}) sniff failed (no jobs endpoint found)")
             return out
 
-        # 5) Query the discovered endpoint for music jobs
+        # final query for "music"
         resp = page.evaluate(
             """async ({variant, tenant, site}) => {
                 const payload = {appliedFacets:{}, limit:50, offset:0, searchText:"music"};
@@ -426,7 +271,6 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
                 if urlp and urlp.startswith("/"):
                     urlp = f"https://{host}{urlp}"
-                # location
                 loc = ""
                 locs = j.get("locations") or j.get("bulletFields") or []
                 if isinstance(locs, list):
@@ -447,8 +291,7 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         browser.close()
     return out
 
-
-# ---------------- Workable ----------------
+# ---------------- Workable (API first, HTML fallback) ----------------
 def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Workable adapter with API-first, HTML-fallback strategy.
@@ -465,6 +308,9 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     def try_api(acc: str) -> List[Dict[str, Any]]:
         url = f"https://apply.workable.com/api/v3/accounts/{acc}/jobs?state=published"
         r = SESSION.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code == 404:
+            print(f"[INFO] workable:{acc} API 404 (using HTML fallback)", file=sys.stderr)
+            return []
         if r.status_code >= 400:
             _warn(f"[WARN] workable:{acc} -> HTTP {r.status_code}")
             return []
@@ -483,16 +329,6 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             if job_matches_music(f"{title}\n{location}\n{desc}"):
                 jid = j.get("id") or j.get("shortcode") or ""
                 rows.append(mk_row(company, "workable", title, location, str(jid), url, "", "title_or_description"))
-                # inside fetch_workable -> try_api()
-        r = SESSION.get(url, timeout=REQ_TIMEOUT)
-        if r.status_code == 404:
-        # This account doesn't expose the JSON API; we'll try HTML fallback next.
-            print(f"[INFO] workable:{acc} API 404 (using HTML fallback)", file=sys.stderr)
-                return []
-        if r.status_code >= 400:
-            _warn(f"[WARN] workable:{acc} -> HTTP {r.status_code}")
-            return []
-
         return rows
 
     # ---------- 2) HTML fallback ----------
@@ -504,7 +340,6 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             return []
         soup = BeautifulSoup(r.text, "lxml")
 
-        # Collect job links like /<account>/j/<SHORTCODE>/...
         links = set()
         for a in soup.select("a[href*='/j/']"):
             href = a.get("href")
@@ -538,7 +373,6 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 rows.append(mk_row(company, "workable", title, location, jid, job_url, "", "html_text"))
         return rows
 
-    # Try API (original, then no-hyphen) and fall back to HTML if needed
     out.extend(try_api(account))
     if not out and "-" in account:
         out.extend(try_api(account.replace("-", "")))
@@ -547,8 +381,6 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not out and "-" in account:
             out.extend(try_html(account.replace("-", "")))
     return out
-
-
 
 # ---------------- iCIMS (HTML) ----------------
 def _text(el) -> str:
@@ -564,7 +396,6 @@ def fetch_icims(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not host:
         return out
 
-    # Main search page
     search_url = f"https://{host}/jobs/search"
     r = SESSION.get(search_url, timeout=REQ_TIMEOUT)
     if r.status_code >= 400:
@@ -596,7 +427,6 @@ def fetch_icims(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             out.append(mk_row(company, "icims", title, location, jid, job_url, "", "html_text"))
     return out
 
-
 # ---------------- Teamtailor (JSON-LD in HTML) ----------------
 def fetch_teamtailor(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -610,7 +440,6 @@ def fetch_teamtailor(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         _warn(f"[WARN] teamtailor:{host} -> HTTP {r.status_code}")
         return out
     soup = BeautifulSoup(r.text, "lxml")
-    # JSON-LD blocks may contain job data
     scripts = soup.find_all("script", type="application/ld+json")
     jobs = []
     for sc in scripts:
@@ -645,24 +474,26 @@ def fetch_adp(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     company = entry.get("company") or host
     if not host:
         return out
-    # Try common public listing page(s)
     urls = [f"https://{host}/career-center/search", f"https://{host}/career-center"]
     for url in urls:
         r = SESSION.get(url, timeout=REQ_TIMEOUT)
         if r.status_code >= 400:
             continue
         soup = BeautifulSoup(r.text, "lxml")
-        for a in soup.select("a[href*='job?'] , a[href*='/job/'] , a[href*='positions']"):
+        for a in soup.select("a[href*='job?'], a[href*='/job/'], a[href*='positions']"):
             job_url = a.get("href")
-            if not job_url: continue
+            if not job_url:
+                continue
             if job_url.startswith("/"):
                 job_url = f"https://{host}{job_url}"
             jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
-            if jr.status_code >= 400: continue
+            if jr.status_code >= 400:
+                continue
             jsoup = BeautifulSoup(jr.text, "lxml")
-            title = (jsoup.find("h1") or jsoup.find("h2") or {}).get_text(strip=True) if jsoup else ""
+            title_el = jsoup.find("h1") or jsoup.find("h2")
+            title = title_el.get_text(strip=True) if title_el else ""
             location = ""
-            desc = jsoup.get_text(" ", strip=True)[:20000] if jsoup else ""
+            desc = jsoup.get_text(" ", strip=True)[:20000]
             if job_matches_music(f"{title}\n{location}\n{desc}"):
                 out.append(mk_row(company, "adp", title, location, job_url, job_url, "", "html_text"))
     return out
@@ -674,7 +505,6 @@ def fetch_successfactors(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     company = entry.get("company") or host
     if not host:
         return out
-    # Try main careers domain; tenants vary a lot, so we parse listing page then details
     r = SESSION.get(f"https://{host}", timeout=REQ_TIMEOUT)
     if r.status_code >= 400:
         _warn(f"[WARN] successfactors:{host} -> HTTP {r.status_code}")
@@ -686,11 +516,13 @@ def fetch_successfactors(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         if job_url.startswith("/"):
             job_url = f"https://{host}{job_url}"
         jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
-        if jr.status_code >= 400: continue
+        if jr.status_code >= 400:
+            continue
         jsoup = BeautifulSoup(jr.text, "lxml")
-        title = (jsoup.find("h1") or jsoup.find("h2") or {}).get_text(strip=True) if jsoup else ""
+        title_el = jsoup.find("h1") or jsoup.find("h2")
+        title = title_el.get_text(strip=True) if title_el else ""
         location = ""
-        desc = jsoup.get_text(" ", strip=True)[:20000] if jsoup else ""
+        desc = jsoup.get_text(" ", strip=True)[:20000]
         if job_matches_music(f"{title}\n{location}\n{desc}"):
             out.append(mk_row(company, "successfactors", title, location, job_url, job_url, "", "html_text"))
     return out
@@ -707,17 +539,20 @@ def fetch_jobvite(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         _warn(f"[WARN] jobvite:{host} -> HTTP {r.status_code}")
         return out
     soup = BeautifulSoup(r.text, "lxml")
-    for a in soup.select("a[href*='jobs?'] , a[href*='/job/'] , a[href*='?jvi='] , a[href*='/jobs/']"):
+    for a in soup.select("a[href*='jobs?'], a[href*='/job/'], a[href*='?jvi='], a[href*='/jobs/']"):
         job_url = a.get("href")
-        if not job_url: continue
+        if not job_url:
+            continue
         if job_url.startswith("/"):
             job_url = f"https://{host}{job_url}"
         jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
-        if jr.status_code >= 400: continue
+        if jr.status_code >= 400:
+            continue
         jsoup = BeautifulSoup(jr.text, "lxml")
-        title = (jsoup.find("h1") or jsoup.find("h2") or {}).get_text(strip=True) if jsoup else ""
+        title_el = jsoup.find("h1") or jsoup.find("h2")
+        title = title_el.get_text(strip=True) if title_el else ""
         location = ""
-        desc = jsoup.get_text(" ", strip=True)[:20000] if jsoup else ""
+        desc = jsoup.get_text(" ", strip=True)[:20000]
         if job_matches_music(f"{title}\n{location}\n{desc}"):
             out.append(mk_row(company, "jobvite", title, location, job_url, job_url, "", "html_text"))
     return out
@@ -734,16 +569,18 @@ def fetch_pereless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
         _warn(f"[WARN] pereless:{host} -> HTTP {r.status_code}")
         return out
     soup = BeautifulSoup(r.text, "lxml")
-    for a in soup.select("a[href*='JobDetails'] , a[href*='?fulldesc='] , a[href*='/job/'] , a[href*='?pos=']"):
+    for a in soup.select("a[href*='JobDetails'], a[href*='?fulldesc='], a[href*='/job/'], a[href*='?pos=']"):
         job_url = a.get("href")
-        if not job_url: continue
+        if not job_url:
+            continue
         if job_url.startswith("/"):
             job_url = f"https://{host}{job_url}"
         jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
-        if jr.status_code >= 400: continue
+        if jr.status_code >= 400:
+            continue
         jsoup = BeautifulSoup(jr.text, "lxml")
-        title = (jsoup.find("h1") or jsoup.find("h2") or jsoup.title or {})
-        title = title.get_text(strip=True) if hasattr(title, "get_text") else str(title)
+        title_el = jsoup.find("h1") or jsoup.find("h2") or jsoup.title
+        title = title_el.get_text(strip=True) if title_el else ""
         location = ""
         desc = jsoup.get_text(" ", strip=True)[:20000]
         if job_matches_music(f"{title}\n{location}\n{desc}"):
