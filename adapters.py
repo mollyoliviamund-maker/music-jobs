@@ -107,53 +107,116 @@ def fetch_lever(slug: str) -> List[Dict[str, Any]]:
     return out
 
 # ---------------- Workday CxS ----------------
+# ---- helpers for Workday ----
+import re
+from bs4 import BeautifulSoup
+
+def _wd_discover_sites(host: str, tenant: str, seeds: list[str] | None = None) -> list[str]:
+    """
+    Try to discover valid Workday 'site' tokens by scanning public pages.
+    We look for URLs like /en-US/<SiteToken>/ and test them against CxS.
+    """
+    candidates = []
+    seeds = seeds or []
+    # Common defaults
+    defaults = ["Careers", "External", "Career", "Jobs", "US"]
+    for s in seeds + defaults:
+        if s and s not in candidates:
+            candidates.append(s)
+
+    def scrape_for_sites(url: str):
+        try:
+            r = SESSION.get(url, timeout=REQ_TIMEOUT)
+            if r.status_code >= 400:
+                return
+            soup = BeautifulSoup(r.text, "lxml")
+            for a in soup.select("a[href*='/en-US/']"):
+                href = a.get("href") or ""
+                m = re.search(r"/en-US/([^/]+)/", href)
+                if m:
+                    site = m.group(1)
+                    if site and site not in candidates:
+                        candidates.append(site)
+        except Exception:
+            pass
+
+    # Scan a couple of public pages
+    scrape_for_sites(f"https://{host}/")
+    scrape_for_sites(f"https://{host}/en-US")
+    scrape_for_sites(f"https://{host}/en-US/Careers")
+    return candidates[:12]  # keep it small
+
 def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     host = (entry.get("host") or "").strip()
     tenant = (entry.get("tenant") or "").strip()
     site = (entry.get("site") or "").strip()
     company = entry.get("company") or tenant or host
-    if not (host and tenant and site):
-        _warn(f"[WARN] workday bad entry: {entry}")
+    if not (host and tenant):
+        _warn(f"[WARN] workday bad entry (need host+tenant): {entry}")
         return out
-    api = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    offset, limit = 0, 50
-    while True:
-        payload = {"appliedFacets":{}, "limit":limit, "offset":offset, "searchText":"music"}
-        r = SESSION.post(api, data=json.dumps(payload), timeout=REQ_TIMEOUT)
+
+    def try_site(sitename: str) -> List[Dict[str, Any]]:
+        url = f"https://{host}/wday/cxs/{tenant}/{sitename}/jobs"
+        payload = {"appliedFacets": {}, "limit": 50, "offset": 0, "searchText": "music"}
+        r = SESSION.post(url, data=json.dumps(payload), timeout=REQ_TIMEOUT)
         if r.status_code >= 400:
-            _warn(f"[WARN] workday:{tenant}/{site} -> HTTP {r.status_code}")
-            break
+            _warn(f"[WARN] workday:{tenant}/{sitename} -> HTTP {r.status_code}")
+            return []
         try:
             data = r.json()
         except Exception:
-            _warn(f"[WARN] workday:{tenant}/{site} invalid JSON")
-            break
+            _warn(f"[WARN] workday:{tenant}/{sitename} invalid JSON")
+            return []
         jobs = data.get("jobPostings") or data.get("jobs") or []
-        if not jobs:
-            break
+        results: List[Dict[str, Any]] = []
         for j in jobs:
             title = (j.get("title") or "").strip()
-            url = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
-            if url and url.startswith("/"):
-                url = f"https://{host}{url}"
+            # Build URL
+            urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
+            if urlp and urlp.startswith("/"):
+                urlp = f"https://{host}{urlp}"
+            # Location
             loc = ""
             locs = j.get("locations") or j.get("bulletFields") or []
             if isinstance(locs, list):
-                loc = ", ".join([str(x) for x in locs if x])
+                loc = ", ".join(str(x) for x in locs if x)
             elif isinstance(locs, str):
                 loc = locs
-            desc = " ".join([j.get("shortDescription") or "", j.get("jobPostingInfo", {}).get("jobDescription", "")]).strip()
+            # Desc (best-effort)
+            desc = " ".join([
+                j.get("shortDescription") or "",
+                j.get("jobPostingInfo", {}).get("jobDescription", "")
+            ]).strip()
+
             if job_matches_music(f"{title}\n{loc}\n{desc}"):
                 jid = j.get("id") or j.get("jobId") or j.get("externalId") or ""
                 posted = (j.get("postedOn") or j.get("startDate") or "").replace(" ", "T")
                 if posted and not posted.endswith("Z"):
                     posted += "Z"
-                out.append(mk_row(company, "workday", title, loc, str(jid), url, posted, "title_or_description"))
-        if len(jobs) < limit:
-            break
-        offset += limit
+                results.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
+        return results
+
+    # If a site is provided, try it first.
+    tried = set()
+    if site:
+        tried.add(site)
+        out.extend(try_site(site))
+        if out:
+            return out  # good
+
+    # Auto-discover potential sites and try them
+    for s in _wd_discover_sites(host, tenant, seeds=[site] if site else []):
+        if s in tried:
+            continue
+        tried.add(s)
+        res = try_site(s)
+        if res:
+            out.extend(res)
+            break  # first working site is enough
+
     return out
+
 
 # ---------------- Workable ----------------
 def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -162,61 +225,83 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     company = entry.get("company") or account
     if not account:
         return out
-    url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs?state=published"
-    r = SESSION.get(url, timeout=REQ_TIMEOUT)
-    if r.status_code >= 400:
-        _warn(f"[WARN] workable:{account} -> HTTP {r.status_code}")
-        return out
-    try:
-        jobs = (r.json() or {}).get("results", []) or []
-    except Exception:
-        _warn(f"[WARN] workable:{account} invalid JSON")
-        return out
-    for j in jobs:
-        title = j.get("title") or ""
-        url = j.get("url") or ""
-        loc = j.get("location") or {}
-        location = ", ".join([loc.get("city",""), loc.get("region",""), loc.get("country","")]).strip(", ").replace(",,", ",")
-        desc = " ".join([j.get("shortlink"), j.get("description","")]) if isinstance(j.get("description"), str) else ""
-        if job_matches_music(f"{title}\n{location}\n{desc}"):
-            jid = j.get("id") or j.get("shortcode") or ""
-            out.append(mk_row(company, "workable", title, location, str(jid), url, "", "title_or_description"))
+
+    def try_account(acc: str) -> List[Dict[str, Any]]:
+        url = f"https://apply.workable.com/api/v3/accounts/{acc}/jobs?state=published"
+        r = SESSION.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            _warn(f"[WARN] workable:{acc} -> HTTP {r.status_code}")
+            return []
+        try:
+            jobs = (r.json() or {}).get("results", []) or []
+        except Exception:
+            _warn(f"[WARN] workable:{acc} invalid JSON")
+            return []
+        rows: List[Dict[str, Any]] = []
+        for j in jobs:
+            title = j.get("title") or ""
+            url = j.get("url") or ""
+            loc = j.get("location") or {}
+            location = ", ".join([loc.get("city",""), loc.get("region",""), loc.get("country","")]).strip(", ").replace(",,", ",")
+            desc = (j.get("description") or "") if isinstance(j.get("description"), str) else ""
+            if job_matches_music(f"{title}\n{location}\n{desc}"):
+                jid = j.get("id") or j.get("shortcode") or ""
+                rows.append(mk_row(company, "workable", title, location, str(jid), url, "", "title_or_description"))
+        return rows
+
+    # try original, then a version without hyphens (common)
+    out.extend(try_account(account))
+    if not out and "-" in account:
+        out.extend(try_account(account.replace("-", "")))
     return out
 
+
 # ---------------- iCIMS (HTML) ----------------
+def _text(el) -> str:
+    try:
+        return el.get_text(strip=True)
+    except Exception:
+        return ""
+
 def fetch_icims(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     host = (entry.get("host") or "").strip().rstrip("/")
     company = entry.get("company") or host
     if not host:
         return out
-    url = f"https://{host}/jobs/search"
-    r = SESSION.get(url, timeout=REQ_TIMEOUT)
+
+    # Main search page
+    search_url = f"https://{host}/jobs/search"
+    r = SESSION.get(search_url, timeout=REQ_TIMEOUT)
     if r.status_code >= 400:
         _warn(f"[WARN] icims:{host} -> HTTP {r.status_code}")
         return out
+
     soup = BeautifulSoup(r.text, "lxml")
-    cards = soup.select("div.iCIMS_JobList li, div.iCIMS_JobsTable a, a[href*='/jobs/']")
-    seen_urls = set()
+    job_links = set()
     for a in soup.select("a[href*='/jobs/']"):
-        job_url = a.get("href")
-        if not job_url: continue
-        if job_url.startswith("/"):
-            job_url = f"https://{host}{job_url}"
-        if job_url in seen_urls: continue
-        seen_urls.add(job_url)
+        href = a.get("href")
+        if not href:
+            continue
+        if href.startswith("/"):
+            href = f"https://{host}{href}"
+        job_links.add(href)
+
+    for job_url in list(job_links)[:120]:
         jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
-        if jr.status_code >= 400: continue
+        if jr.status_code >= 400:
+            continue
         jsoup = BeautifulSoup(jr.text, "lxml")
-        title = (jsoup.select_one("h1") or jsoup.select_one("h2") or {}).get_text(strip=True) if jsoup else ""
-        location = (jsoup.find("li", class_="iCIMS_JobLocation") or {}).get_text(strip=True) if jsoup else ""
-        desc = jsoup.get_text(" ", strip=True)[:20000] if jsoup else ""
+        title = _text(jsoup.select_one("h1")) or _text(jsoup.select_one("h2")) or _text(jsoup.select_one(".iCIMS_JobTitle"))
+        loc_el = jsoup.find("li", class_="iCIMS_JobLocation") or jsoup.find("span", class_="jobLocation")
+        location = _text(loc_el)
+        desc = jsoup.get_text(" ", strip=True)[:20000]
         if job_matches_music(f"{title}\n{location}\n{desc}"):
-            # try to grab req id from URL
             m = re.search(r"/jobs/(\d+)", job_url)
             jid = m.group(1) if m else job_url
             out.append(mk_row(company, "icims", title, location, jid, job_url, "", "html_text"))
     return out
+
 
 # ---------------- Teamtailor (JSON-LD in HTML) ----------------
 def fetch_teamtailor(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
