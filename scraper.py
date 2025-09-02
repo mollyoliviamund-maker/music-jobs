@@ -3,7 +3,7 @@ from typing import Dict, Any, List
 
 from utils import load_seen, save_seen, append_csv
 from adapters import (
-    fetch_greenhouse, fetch_lever, fetch_workday,
+    fetch_greenhouse, fetch_lever, fetch_workday_headless,
     fetch_workable, fetch_icims, fetch_teamtailor,
     fetch_adp, fetch_successfactors, fetch_jobvite, fetch_pereless
 )
@@ -14,7 +14,7 @@ FETCHERS = {
 }
 
 DICT_FETCHERS = {
-    "workday":         fetch_workday,
+    "workday":         fetch_workday_headless,
     "workable":        fetch_workable,
     "icims":           fetch_icims,
     "teamtailor":      fetch_teamtailor,
