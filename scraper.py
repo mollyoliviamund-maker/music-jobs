@@ -5,7 +5,7 @@ from utils import load_seen, save_seen, append_csv
 from adapters import (
     fetch_greenhouse, fetch_lever, fetch_workday_headless,
     fetch_workable, fetch_icims, fetch_teamtailor,
-    fetch_adp, fetch_successfactors, fetch_jobvite, fetch_pereless
+    fetch_adp, fetch_successfactors, fetch_jobvite, fetch_pereless, fetch_dejobs
 )
 
 FETCHERS = {
@@ -22,6 +22,7 @@ DICT_FETCHERS = {
     "successfactors":  fetch_successfactors,
     "jobvite":         fetch_jobvite,
     "pereless":        fetch_pereless,
+    "dejobs":          fetch_dejobs,
 }
 
 def run(platform_filter=None, company_filter=None):
