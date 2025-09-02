@@ -265,103 +265,168 @@ def fetch_workday(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
 # --- Headless Workday adapter (Playwright) ---
 def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Uses a real Chromium session to call the Workday CxS endpoint from the page context.
-    This avoids 400s due to missing cookies/headers.
-
-    companies.yaml format:
-      - { company: Amplify, host: amplify.wd1.myworkdayjobs.com, tenant: amplify, site: Amplify_Careers }
+    Headless Workday adapter that *sniffs* the portal's own jobs XHR to discover:
+      - variant: /wday/cx/ or /wday/cxs/
+      - tenant:   actually used by the portal (may differ in case)
+      - site:     the real site token
+    Then it posts the same endpoint with searchText="music".
     """
     from playwright.sync_api import sync_playwright
+    import re, json
     out: List[Dict[str, Any]] = []
 
     host = (entry.get("host") or "").strip()
-    tenant = (entry.get("tenant") or "").strip()
+    tenant_hint = (entry.get("tenant") or "").strip()
     site_hint = (entry.get("site") or "").strip()
-    company = entry.get("company") or tenant or host
-    if not (host and tenant):
-        _warn(f"[WARN] workday(headless) bad entry: {entry}")
+    company = entry.get("company") or tenant_hint or host
+    if not host:
+        _warn(f"[WARN] workday(headless) missing host: {entry}")
         return out
 
-    def cxs_fetch(page, site_token: str) -> Optional[Dict[str, Any]]:
-        # Run the POST from within the page so cookies/headers are correct.
-        return page.evaluate(
-            """async ({tenant, site}) => {
-                const payload = {appliedFacets:{}, limit:50, offset:0, searchText:"music"};
-                const res = await fetch(`/wday/cxs/${tenant}/${site}/jobs`, {
-                  method: 'POST',
-                  headers: {'content-type':'application/json'},
-                  body: JSON.stringify(payload),
-                  credentials: 'same-origin'
-                });
-                if (!res.ok) return {ok:false, status: res.status};
-                const json = await res.json();
-                return {ok:true, status: res.status, json};
-            }""",
-            {"tenant": tenant, "site": site_token},
-        )
+    # Keep first discovered endpoint here.
+    sniff = {"variant": None, "tenant": None, "site": None}
 
-    def sites_from_dom(page) -> List[str]:
-        # Collect /en-XX/<SiteToken>/ anchors as candidates.
-        anchors = page.eval_on_selector_all(
-            "a[href*='/en-']", "els => els.map(a => a.getAttribute('href'))"
-        ) or []
-        cand = []
-        for href in anchors:
-            if not href:
-                continue
-            m = re.search(r"/en-[A-Z]{2}/([^/]+)/", href)
-            if m:
-                cand.append(m.group(1))
-        # Add some common fallbacks.
-        cand += ["Careers", "External", "Career", "Jobs", "US", "Students", "Campus"]
-        # De-dupe but keep order
-        seen, ordered = set(), []
-        for s in [site_hint] + [x for x in cand if x] if site_hint else cand:
-            if s and s not in seen:
-                seen.add(s); ordered.append(s)
-        return ordered[:20]
+    def parse_jobs_url(url: str):
+        # Match .../wday/(cx|cxs)/<tenant>/<site>/jobs...
+        m = re.search(r"/wday/(cxs|cx)/([^/]+)/([^/]+)/jobs", url)
+        if m:
+            sniff["variant"], sniff["tenant"], sniff["site"] = m.group(1), m.group(2), m.group(3)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(ignore_https_errors=True, user_agent=(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MusicJobs/HD1"
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 MusicJobs/HD2"
         ))
         page = context.new_page()
 
-        # Hit the root first to establish cookies, then an en-US page if it exists.
-        for url in [f"https://{host}/", f"https://{host}/en-US"]:
+        # Watch all responses to capture the portal's own jobs call.
+        def on_response(resp):
+            url = resp.url
+            if "/wday/cx" in url or "/wday/cxs" in url:
+                parse_jobs_url(url)
+        page.on("response", on_response)
+
+        # 1) Land on the host root to establish cookies
+        for url in [f"https://{host}/", f"https://{host}/en-US", f"https://{host}/career", f"https://{host}/careers"]:
             try:
                 page.goto(url, wait_until="networkidle", timeout=45000)
                 break
             except Exception:
                 continue
 
-        # Build candidate site tokens and try them until one returns JSON.
-        for site_token in sites_from_dom(page):
-            try:
-                # Navigate to a page under that site (improves success for some tenants)
-                page.goto(f"https://{host}/en-US/{site_token}", wait_until="networkidle", timeout=45000)
-            except Exception:
-                pass
+        # 2) Try a few obvious portal pages to trigger the jobs XHR
+        candidate_paths = []
+        # collect hrefs from the DOM that look promising
+        try:
+            hrefs = page.eval_on_selector_all(
+                "a[href]", "els => els.map(a => a.getAttribute('href'))"
+            ) or []
+        except Exception:
+            hrefs = []
 
+        for h in hrefs:
+            if not h:
+                continue
+            if h.startswith("//"):  # protocol-relative
+                h = "https:" + h
+            if h.startswith("/"):
+                h = f"https://{host}{h}"
+            if host not in h:
+                continue
+            # keep likely career/search links
+            if any(k in h.lower() for k in ["career", "careers", "jobs", "search", "/en-"]):
+                candidate_paths.append(h)
+
+        # Always try common en-US paths first
+        hardcoded = [
+            f"https://{host}/en-US/Careers",
+            f"https://{host}/en-US/External",
+            f"https://{host}/en-US/Jobs",
+            f"https://{host}/en-US/{site_hint}" if site_hint else None,
+        ]
+        candidate_paths = [u for u in hardcoded if u] + candidate_paths[:20]
+
+        for u in candidate_paths[:25]:
+            if sniff["variant"]:
+                break
             try:
-                resp = cxs_fetch(page, site_token)
+                page.goto(u, wait_until="networkidle", timeout=45000)
             except Exception:
-                _warn(f"[WARN] workday(headless):{tenant}/{site_token} JS fetch failed")
                 continue
 
-            if not resp or not resp.get("ok"):
-                _warn(f"[WARN] workday:{tenant}/{site_token} -> HTTP {resp.get('status') if resp else 'n/a'}")
-                continue
+        # 3) If we still didn't sniff anything, try a direct POST with common variants
+        def try_direct(variant: str, tenant: str, site: str):
+            return page.evaluate(
+                """async ({variant, tenant, site}) => {
+                    const payload = {appliedFacets:{}, limit:50, offset:0, searchText:"music"};
+                    const res = await fetch(`/wday/${variant}/${tenant}/${site}/jobs`, {
+                      method: 'POST',
+                      headers: {'content-type':'application/json'},
+                      body: JSON.stringify(payload),
+                      credentials: 'same-origin'
+                    });
+                    return {ok: res.ok, status: res.status};
+                }""",
+                {"variant": variant, "tenant": tenant, "site": site},
+            )
 
-            jobs = (resp.get("json") or {}).get("jobPostings") or (resp.get("json") or {}).get("jobs") or []
+        if not sniff["variant"]:
+            tenants = [sniff["tenant"], tenant_hint, (tenant_hint or "").lower(),
+                       (tenant_hint or "").upper()]
+            sites = [sniff["site"], site_hint, "Careers", "External", "Jobs", "US", "Students", "Campus"]
+            tenants = [t for t in tenants if t]
+            sites = [s for s in sites if s]
+            tried = set()
+            for v in ("cxs", "cx"):
+                for t in tenants:
+                    for s in sites:
+                        key = (v, t, s)
+                        if key in tried: 
+                            continue
+                        tried.add(key)
+                        try:
+                            res = try_direct(v, t, s)
+                            if res and res.get("ok"):
+                                sniff["variant"], sniff["tenant"], sniff["site"] = v, t, s
+                                break
+                        except Exception:
+                            continue
+                    if sniff["variant"]:
+                        break
+                if sniff["variant"]:
+                    break
+
+        # 4) If still nothing, bail.
+        if not sniff["variant"]:
+            context.close(); browser.close()
+            _warn(f"[WARN] workday({company}) sniff failed (no jobs endpoint found)")
+            return out
+
+        # 5) Query the discovered endpoint for music jobs
+        resp = page.evaluate(
+            """async ({variant, tenant, site}) => {
+                const payload = {appliedFacets:{}, limit:50, offset:0, searchText:"music"};
+                const r = await fetch(`/wday/${variant}/${tenant}/${site}/jobs`, {
+                  method:'POST',
+                  headers:{'content-type':'application/json'},
+                  body: JSON.stringify(payload),
+                  credentials:'same-origin'
+                });
+                if (!r.ok) return null;
+                return await r.json();
+            }""",
+            sniff,
+        )
+
+        if resp:
+            jobs = (resp.get("jobPostings") or resp.get("jobs") or [])
             for j in jobs:
                 title = (j.get("title") or "").strip()
                 urlp = j.get("externalPath") or j.get("externalUrl") or j.get("url") or ""
                 if urlp and urlp.startswith("/"):
                     urlp = f"https://{host}{urlp}"
-                # Location
+                # location
                 loc = ""
                 locs = j.get("locations") or j.get("bulletFields") or []
                 if isinstance(locs, list):
@@ -378,12 +443,8 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                     if posted and not posted.endswith("Z"): posted += "Z"
                     out.append(mk_row(company, "workday", title, loc, str(jid), urlp, posted, "title_or_description"))
 
-            if out:
-                break  # first working site is enough
-
         context.close()
         browser.close()
-
     return out
 
 
