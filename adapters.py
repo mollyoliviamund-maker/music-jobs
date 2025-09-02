@@ -483,6 +483,16 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
             if job_matches_music(f"{title}\n{location}\n{desc}"):
                 jid = j.get("id") or j.get("shortcode") or ""
                 rows.append(mk_row(company, "workable", title, location, str(jid), url, "", "title_or_description"))
+                # inside fetch_workable -> try_api()
+        r = SESSION.get(url, timeout=REQ_TIMEOUT)
+        if r.status_code == 404:
+        # This account doesn't expose the JSON API; we'll try HTML fallback next.
+            print(f"[INFO] workable:{acc} API 404 (using HTML fallback)", file=sys.stderr)
+                return []
+        if r.status_code >= 400:
+            _warn(f"[WARN] workable:{acc} -> HTTP {r.status_code}")
+            return []
+
         return rows
 
     # ---------- 2) HTML fallback ----------
