@@ -450,13 +450,19 @@ def fetch_workday_headless(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 # ---------------- Workable ----------------
 def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Workable adapter with API-first, HTML-fallback strategy.
+    - API:  https://apply.workable.com/api/v3/accounts/<account>/jobs?state=published
+    - HTML: https://apply.workable.com/<account>/  (parse job links, then job pages)
+    """
     out: List[Dict[str, Any]] = []
     account = (entry.get("account") or "").strip()
     company = entry.get("company") or account
     if not account:
         return out
 
-    def try_account(acc: str) -> List[Dict[str, Any]]:
+    # ---------- 1) Try public API ----------
+    def try_api(acc: str) -> List[Dict[str, Any]]:
         url = f"https://apply.workable.com/api/v3/accounts/{acc}/jobs?state=published"
         r = SESSION.get(url, timeout=REQ_TIMEOUT)
         if r.status_code >= 400:
@@ -479,11 +485,59 @@ def fetch_workable(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
                 rows.append(mk_row(company, "workable", title, location, str(jid), url, "", "title_or_description"))
         return rows
 
-    # try original, then a version without hyphens (common)
-    out.extend(try_account(account))
+    # ---------- 2) HTML fallback ----------
+    def try_html(acc: str) -> List[Dict[str, Any]]:
+        list_url = f"https://apply.workable.com/{acc}/"
+        r = SESSION.get(list_url, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            _warn(f"[WARN] workable(html):{acc} list -> HTTP {r.status_code}")
+            return []
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Collect job links like /<account>/j/<SHORTCODE>/...
+        links = set()
+        for a in soup.select("a[href*='/j/']"):
+            href = a.get("href")
+            if not href:
+                continue
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = "https://apply.workable.com" + href
+            elif href.startswith("http"):
+                pass
+            else:
+                href = f"https://apply.workable.com/{acc}/{href}"
+            if f"/{acc}/j/" in href:
+                links.add(href)
+
+        rows: List[Dict[str, Any]] = []
+        for job_url in list(links)[:100]:
+            jr = SESSION.get(job_url, timeout=REQ_TIMEOUT)
+            if jr.status_code >= 400:
+                continue
+            jsoup = BeautifulSoup(jr.text, "lxml")
+            h1 = jsoup.find("h1")
+            title = h1.get_text(strip=True) if h1 else ""
+            loc_el = jsoup.select_one("[data-ui='job-location'], .job-location, .job-details__location")
+            location = loc_el.get_text(strip=True) if loc_el else ""
+            desc = jsoup.get_text(" ", strip=True)[:20000]
+            if job_matches_music(f"{title}\n{location}\n{desc}"):
+                m = re.search(r"/j/([A-Z0-9]+)/", job_url)
+                jid = m.group(1) if m else job_url
+                rows.append(mk_row(company, "workable", title, location, jid, job_url, "", "html_text"))
+        return rows
+
+    # Try API (original, then no-hyphen) and fall back to HTML if needed
+    out.extend(try_api(account))
     if not out and "-" in account:
-        out.extend(try_account(account.replace("-", "")))
+        out.extend(try_api(account.replace("-", "")))
+    if not out:
+        out.extend(try_html(account))
+        if not out and "-" in account:
+            out.extend(try_html(account.replace("-", "")))
     return out
+
 
 
 # ---------------- iCIMS (HTML) ----------------
