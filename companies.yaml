@@ -5,7 +5,7 @@ greenhouse:
   - clever
   - classdojo
   - newsela
-  - goalbook
+  - goalbookapp       # ← was 'goalbook'
   - opensesame
   - ixllearning
   - goguardian
