@@ -1,14 +1,31 @@
+# Greenhouse & Lever: list of slugs
 greenhouse:
   - duolingo
-  - coursera
-  - outschool
-  - clever
-  - classdojo
-  - newsela
-  - goalbook
-  - opensesame
-  - ixllearning
-
 lever:
-  # (No confirmed public Lever slugs yet — reupeducation, udacity uncertain)
-  # We'll leave this block empty until we verify.
+  - instructure
+
+# Workday CxS: list of dicts (host/tenant/site)
+workday:
+  - { company: Amplify, host: amplify.wd1.myworkdayjobs.com, tenant: amplify, site: Amplify_Careers }
+
+# Other ATS use "ats" blocks (host is the base domain of the careers site)
+workable:
+  - { company: Riverside Insights, account: riverside-insights }  # apply.workable.com/api/v3/accounts/<account>/jobs
+
+icims:
+  - { company: PowerSchool, host: careers-powerschool.icims.com }
+
+teamtailor:
+  - { company: Data Recognition Corporation, host: careers.datarecognitioncorp.com }
+
+adp:
+  - { company: Cognia, host: workforcenow.adp.com }  # public job list page
+
+successfactors:
+  - { company: HMH, host: careers.hmhco.com }
+
+jobvite:
+  - { company: Imagine Learning, host: jobs.jobvite.com }
+
+pereless:
+  - { company: ETS, host: etscareers.submit4jobs.com }
