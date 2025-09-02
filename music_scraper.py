@@ -57,35 +57,49 @@ def _safe_get(url: str) -> Optional[requests.Response]:
 
 # ---------- Greenhouse ----------
 def fetch_greenhouse(company_slug: str) -> List[Dict[str, Any]]:
+    """
+    Uses the official public Boards API:
+    https://boards-api.greenhouse.io/v1/boards/<slug>/jobs?content=true
+    """
     out: List[Dict[str, Any]] = []
-    url = f"https://boards.greenhouse.io/{company_slug}.json"
+    url = f"https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs?content=true"
     r = _safe_get(url)
     if not r:
-        print(f"[WARN] greenhouse:{company_slug} JSON fetch failed", file=sys.stderr)
+        print(f"[WARN] greenhouse:{company_slug} API fetch failed", file=sys.stderr)
         return out
+
     try:
         data = r.json()
+        jobs = data.get("jobs", []) or []
     except Exception:
         print(f"[WARN] greenhouse:{company_slug} invalid JSON body", file=sys.stderr)
         return out
 
-    for job in data.get("jobs", []) or []:
-        title = job.get("title", "") or ""
-        location = (job.get("location") or {}).get("name", "") or ""
-        abs_url = job.get("absolute_url", "") or ""
-        job_id = str(job.get("id", "") or "")
+    for job in jobs:
+        title = job.get("title") or ""
+        job_id = str(job.get("id") or "")
+        abs_url = job.get("absolute_url") or ""
+        # location: join office names if present
+        offices = job.get("offices") or []
+        location = ", ".join([o.get("name", "") for o in offices if isinstance(o, dict)]) or ""
+        # content contains HTML description when content=true
+        desc = job.get("content") or ""
 
-        # Fast path: title contains music
-        if job_matches_music(title):
-            out.append(mk_row(company_slug, "greenhouse", title, location, job_id, abs_url, "", "title"))
+        matched_on = None
+        if job_matches_music(f"{title}\n{location}\n{desc}"):
+            matched_on = "title_or_description"
+
+        if not matched_on:
             continue
 
-        # Slow path: fetch HTML once to search body
-        if abs_url:
-            jr = _safe_get(abs_url)
-            if jr and job_matches_music(f"{title}\n{location}\n{jr.text or ''}"):
-                out.append(mk_row(company_slug, "greenhouse", title, location, job_id, abs_url, "", "description"))
+        # Greenhouse boards API exposes updated_at; posted_at varies by tenant
+        posted_iso = (job.get("updated_at") or "").replace(" ", "T")  # GH returns 'YYYY-MM-DD HH:MM:SS'
+        if posted_iso and not posted_iso.endswith("Z"):
+            posted_iso += "Z"
+
+        out.append(mk_row(company_slug, "greenhouse", title, location, job_id, abs_url, posted_iso, matched_on))
     return out
+
 
 # ---------- Lever ----------
 def fetch_lever(company_slug: str) -> List[Dict[str, Any]]:
