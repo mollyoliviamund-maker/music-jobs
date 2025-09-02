@@ -3,21 +3,17 @@ from datetime import datetime, timezone
 from typing import Dict, Any
 from urllib.parse import urlparse, urlunparse
 
-# Pattern to match "music" in any case
 MUSIC_PATTERN = re.compile(r"\bmusic\b", re.IGNORECASE)
 
-# File paths
 CSV_PATH = "music_jobs.csv"
 SEEN_PATH = "seen_music.json"
 
-# CSV column headers
 CSV_HEADERS = [
     "company", "platform", "title", "location", "job_id",
     "url", "posted_at_iso", "detected_on_iso", "matched_on"
 ]
 
 def _normalize_url(u: str) -> str:
-    """Strip query strings/fragments for stable deduplication keys."""
     if not u:
         return ""
     try:
@@ -27,7 +23,6 @@ def _normalize_url(u: str) -> str:
         return u
 
 def load_seen() -> set:
-    """Load already-seen job IDs/URLs from JSON file."""
     if os.path.exists(SEEN_PATH):
         with open(SEEN_PATH, "r", encoding="utf-8") as f:
             try:
@@ -39,20 +34,16 @@ def load_seen() -> set:
     return set()
 
 def save_seen(seen: set) -> None:
-    """Save seen job IDs/URLs back to JSON file."""
     with open(SEEN_PATH, "w", encoding="utf-8") as f:
         json.dump(sorted(list(seen)), f, indent=2)
 
 def ensure_csv() -> None:
-    """Create CSV with headers if it does not exist."""
     needs_header = not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0
     if needs_header:
         with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADERS)
+            csv.writer(f).writerow(CSV_HEADERS)
 
 def append_csv(row: Dict[str, Any]) -> None:
-    """Append a row to the CSV file."""
     ensure_csv()
     row = dict(row)
     row["url"] = _normalize_url(row.get("url", ""))
@@ -61,15 +52,12 @@ def append_csv(row: Dict[str, Any]) -> None:
         writer.writerow([row.get(h, "") for h in CSV_HEADERS])
 
 def job_matches_music(text: str) -> bool:
-    """Check if the text contains the word 'music'."""
     return bool(MUSIC_PATTERN.search(text or ""))
 
 def normalized_now() -> str:
-    """Return current UTC time in ISO format with Z suffix."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def mk_row(company:str, platform:str, title:str, location:str, job_id:str, url:str, posted_at:str, matched_on:str) -> Dict[str, Any]:
-    """Build a standardized row dict for writing to CSV."""
     return {
         "company": company,
         "platform": platform,
@@ -79,5 +67,5 @@ def mk_row(company:str, platform:str, title:str, location:str, job_id:str, url:s
         "url": _normalize_url(url or ""),
         "posted_at_iso": posted_at or "",
         "detected_on_iso": normalized_now(),
-        "matched_on": matched_on or "title_or_description"
+        "matched_on": matched_on or "title_or_description",
     }
